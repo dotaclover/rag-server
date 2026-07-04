@@ -1,0 +1,5 @@
+*.exe
+*.dll
+*.so
+data/index.bin
+vendor/
