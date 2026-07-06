@@ -266,7 +266,7 @@
             results.style.display = 'none';
 
             try {
-                const response = await fetch('/api/search', {
+                const response = await fetch('api/search', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ query, top_k: 5 })

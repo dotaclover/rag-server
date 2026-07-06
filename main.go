@@ -18,6 +18,7 @@ import (
 var content embed.FS
 
 var (
+	host      = flag.String("host", "127.0.0.1", "HTTP host")
 	port      = flag.String("port", "9093", "HTTP port")
 	indexPath = flag.String("index", "data/index.bin", "Path to RAG index")
 )
@@ -73,11 +74,11 @@ func main() {
 	http.HandleFunc("/api/search", handleSearch)
 	http.HandleFunc("/api/status", handleStatus)
 	
-	addr := ":" + *port
+	addr := *host + ":" + *port
 	fmt.Printf("\n" + strings.Repeat("=", 50) + "\n")
 	fmt.Printf("  ACFlow RAG 检索服务\n")
 	fmt.Printf(strings.Repeat("=", 50) + "\n\n")
-	fmt.Printf("  🌐 访问地址: http://127.0.0.1%s\n", addr)
+	fmt.Printf("  🌐 访问地址: http://%s\n", addr)
 	fmt.Printf("  📚 文档数量: %d\n", len(store.Docs))
 	fmt.Printf("  📊 向量维度: %d\n", store.Dimension)
 	fmt.Printf("  🤖 模型: %s\n\n", store.Model)
