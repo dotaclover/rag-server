@@ -68,14 +68,14 @@ func (s *Searcher) SearchWithOptions(ctx context.Context, query string, opts Sea
 	if err != nil {
 		return nil, err
 	}
-	queryLower := opts.Profile.expand(strings.ToLower(query))
+	queryLower := opts.Profile.expand(expandProductDocsQuery(strings.ToLower(query)))
 	weights := opts.Profile.weights()
 	results := make([]Result, 0, len(s.store.Docs))
 	for _, doc := range s.store.Docs {
 		if !opts.Profile.allowsSource(doc.Source) {
 			continue
 		}
-		vectorScore := cosine(qv, doc.Embedding)
+		vectorScore := cosineFloat64(qv, doc.Embedding)
 		textLower := strings.ToLower(doc.Title + " " + doc.Section + " " + doc.Text)
 		keywordScore := keywordScore(queryLower, textLower)
 		score := vectorScore*weights.Vector + keywordScore*weights.Keyword
@@ -101,7 +101,7 @@ func (s *Searcher) SearchWithOptions(ctx context.Context, query string, opts Sea
 	return results, nil
 }
 
-func cosine(a, b []float64) float64 {
+func cosineFloat64(a, b []float64) float64 {
 	n := len(a)
 	if len(b) < n {
 		n = len(b)
@@ -142,6 +142,50 @@ func keywordScore(query, text string) float64 {
 	return score
 }
 
+var keywordTerms = []string{
+	"default model", "http request", "knowledge", "marketplace", "provider", "workflow", "chatflow",
+	"embedding", "webapp", "agent", "dify", "dify cloud", "api", "llm", "mcp", "rag",
+	"docker", "docker compose", "compose", "cloud", "sandbox", "community edition",
+	"模型供应商", "外部知识库", "默认模型", "工作空间", "聊天助手", "文本生成", "问题分类器",
+	"知识库", "工作流", "对话流", "数据源", "提示词", "发布", "应用", "节点", "模型",
+	"插件", "集成", "工具", "团队", "成员", "权限", "变量", "会话", "记忆", "日志",
+	"监控", "文档", "分段", "索引", "检索", "召回", "重排序", "嵌入", "接口", "密钥",
+	"创建", "测试", "配置", "导入", "上传", "部署", "安装", "调用", "发布", "调试",
+	"运行", "输出", "输入", "文件", "套餐", "用量", "主要功能", "功能", "区别",
+	"本地", "线上", "版本", "自部署", "本地部署", "托管", "基础设施", "开源",
+	"开箱即用", "沙箱", "社区版",
+}
+
+func expandProductDocsQuery(query string) string {
+	var expansions []string
+	add := func(terms ...string) {
+		for _, term := range terms {
+			if !strings.Contains(query, strings.ToLower(term)) {
+				expansions = append(expansions, term)
+			}
+		}
+	}
+	if strings.Contains(query, "线上") || strings.Contains(query, "cloud") {
+		add("dify", "dify cloud", "托管", "无需安装", "sandbox")
+	}
+	if strings.Contains(query, "本地") || strings.Contains(query, "自部署") {
+		add("dify", "自部署", "community edition", "docker compose", "基础设施")
+	}
+	if strings.Contains(query, "安装") || strings.Contains(query, "部署") {
+		add("dify", "自部署", "docker compose", "community edition")
+	}
+	if strings.Contains(query, "主要功能") || strings.Contains(query, "功能") {
+		add("dify", "应用", "工作流", "对话流", "知识库", "agent", "发布")
+	}
+	if strings.Contains(query, "版本") {
+		add("dify", "dify cloud", "自部署", "community edition")
+	}
+	if len(expansions) == 0 {
+		return query
+	}
+	return strings.TrimSpace(query + " " + strings.Join(expansions, " "))
+}
+
 func excerpt(text string, maxRunes int) string {
 	runes := []rune(strings.TrimSpace(text))
 	if len(runes) <= maxRunes {
@@ -159,27 +203,41 @@ func tokenize(text string) []string {
 	if text == "" {
 		return nil
 	}
+	seen := map[string]bool{}
 	var tokens []string
-	var current []rune
-	flush := func() {
-		if len(current) > 0 {
-			tokens = append(tokens, string(current))
-			current = current[:0]
+	add := func(token string) {
+		token = strings.TrimSpace(strings.ToLower(token))
+		if token == "" || seen[token] {
+			return
+		}
+		seen[token] = true
+		tokens = append(tokens, token)
+	}
+	for _, term := range keywordTerms {
+		if strings.Contains(text, term) {
+			add(term)
 		}
 	}
 	for len(text) > 0 {
 		r, size := utf8.DecodeRuneInString(text)
 		text = text[size:]
-		if isTokenRune(r) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			var current []rune
 			current = append(current, r)
-			if r >= 0x4e00 && r <= 0x9fff {
-				flush()
+			for len(text) > 0 {
+				next, nextSize := utf8.DecodeRuneInString(text)
+				if !((next >= 'a' && next <= 'z') || (next >= '0' && next <= '9')) {
+					break
+				}
+				current = append(current, next)
+				text = text[nextSize:]
 			}
-			continue
+			word := string(current)
+			if len(word) > 1 {
+				add(word)
+			}
 		}
-		flush()
 	}
-	flush()
 	return tokens
 }
 

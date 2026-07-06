@@ -10,31 +10,31 @@ import (
 	"acflow-rag/rag"
 )
 
-const fallbackDoc = `# 劳动法知识样例
+const fallbackDoc = `# Dify 产品文档知识样例
 
-## 劳动合同
+## 工作流
 
-建立劳动关系，应当订立书面劳动合同。
+工作流适合处理单轮任务，可以通过 Web 应用界面和 API 批量执行。
 
-## 试用期
+## 对话流
 
-劳动合同期限三年以上固定期限和无固定期限劳动合同，试用期不得超过六个月。
+对话流适合需要多轮上下文的对话场景，可以结合会话变量和记忆。
 
-## 加班
+## 知识库
 
-休息日安排劳动者工作又不能安排补休的，应当支付不低于工资百分之二百的工资报酬。
+知识库用于导入文档与数据，应用可以检索并引用这些内容。
 `
 
 func main() {
 	engine := rag.NewEngine()
-	engine.AddDocument("labor-law-sample", loadSampleDoc())
+	engine.AddDocument("dify-docs-sample", loadSampleDoc())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", home)
 	mux.HandleFunc("/api/ask", func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query().Get("q")
 		if query == "" {
-			query = "试用期最长多久？"
+			query = "工作流适合什么任务？"
 		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(engine.Answer(query))
@@ -45,7 +45,7 @@ func main() {
 }
 
 func loadSampleDoc() string {
-	content, err := os.ReadFile("data/labor-law-sample.md")
+	content, err := os.ReadFile("data/product-docs-sample.md")
 	if err != nil {
 		return fallbackDoc
 	}
@@ -72,7 +72,7 @@ func home(w http.ResponseWriter, _ *http.Request) {
 <main>
   <h1>acflow-rag</h1>
   <p>最小 RAG Pipeline：Document -> Chunk -> Retrieve -> Prompt -> Answer -> Citation。</p>
-  <input id="q" value="试用期最长多久？" />
+  <input id="q" value="工作流适合什么任务？" />
   <button id="ask">提问</button>
   <pre id="out"></pre>
 </main>

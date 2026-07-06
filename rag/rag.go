@@ -112,7 +112,7 @@ func summarize(query string, hits []Hit) string {
 		runes := []rune(best)
 		best = string(runes[:180]) + "..."
 	}
-	return best + "\n\n这个回答由检索片段生成，建议结合原文和实际法律场景进一步确认。问题：" + query
+	return best + "\n\n这个回答由检索片段生成，建议结合原文和实际产品配置进一步确认。问题：" + query
 }
 
 func vectorize(text string) map[string]float64 {

@@ -6,20 +6,20 @@ func TestEngineSearchAndAnswer(t *testing.T) {
 	engine := NewEngine()
 	engine.AddDocument("sample", `# Sample
 
-## 试用期
+## 工作流
 
-三年以上固定期限和无固定期限劳动合同，试用期不得超过六个月。
+工作流适合处理单轮任务，可以通过 Web 应用界面和 API 批量执行。
 
-## 加班
+## 知识库
 
-休息日安排劳动者工作又不能安排补休的，应当支付不低于工资百分之二百的工资报酬。
+知识库用于导入文档与数据，应用可以检索并引用这些内容。
 `)
 
-	hits := engine.Search("试用期最长多久", 2)
+	hits := engine.Search("工作流适合什么任务", 2)
 	if len(hits) == 0 {
 		t.Fatal("expected at least one search hit")
 	}
-	result := engine.Answer("试用期最长多久")
+	result := engine.Answer("工作流适合什么任务")
 	if result["answer"] == "" {
 		t.Fatalf("expected answer, got %+v", result)
 	}

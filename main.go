@@ -182,7 +182,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func search(query string, topK int, minScore float64) []Result {
-	queryLower := strings.ToLower(query)
+	queryLower := expandProductDocsQuery(strings.ToLower(query))
 	minScore = normalizeScoreThreshold(minScore)
 
 	type scored struct {
@@ -213,8 +213,8 @@ func search(query string, topK int, minScore float64) []Result {
 		text := s.doc.Text
 		// 按字符数截断，不是字节数，避免中文乱码
 		runes := []rune(text)
-		if len(runes) > 200 {
-			text = string(runes[:200]) + "..."
+		if len(runes) > 520 {
+			text = string(runes[:520]) + "..."
 		}
 		results[i] = Result{
 			ID:      s.doc.ID,
@@ -270,7 +270,6 @@ func noResultsMessage(minScore float64) string {
 }
 
 func keywordScore(query, text string) float64 {
-	// 中文按字符分词，英文按空格分词
 	tokens := tokenize(query)
 	if len(tokens) == 0 {
 		return 0
@@ -297,29 +296,86 @@ func keywordScore(query, text string) float64 {
 	return score
 }
 
+var keywordTerms = []string{
+	"default model", "http request", "knowledge", "marketplace", "provider", "workflow", "chatflow",
+	"embedding", "webapp", "agent", "dify", "dify cloud", "api", "llm", "mcp", "rag",
+	"docker", "docker compose", "compose", "cloud", "sandbox", "community edition",
+	"模型供应商", "外部知识库", "默认模型", "工作空间", "聊天助手", "文本生成", "问题分类器",
+	"知识库", "工作流", "对话流", "数据源", "提示词", "发布", "应用", "节点", "模型",
+	"插件", "集成", "工具", "团队", "成员", "权限", "变量", "会话", "记忆", "日志",
+	"监控", "文档", "分段", "索引", "检索", "召回", "重排序", "嵌入", "接口", "密钥",
+	"创建", "测试", "配置", "导入", "上传", "部署", "安装", "调用", "发布", "调试",
+	"运行", "输出", "输入", "文件", "套餐", "用量", "主要功能", "功能", "区别",
+	"本地", "线上", "版本", "自部署", "本地部署", "托管", "基础设施", "开源",
+	"开箱即用", "沙箱", "社区版",
+}
+
+func expandProductDocsQuery(query string) string {
+	var expansions []string
+	add := func(terms ...string) {
+		for _, term := range terms {
+			if !strings.Contains(query, strings.ToLower(term)) {
+				expansions = append(expansions, term)
+			}
+		}
+	}
+	if strings.Contains(query, "线上") || strings.Contains(query, "cloud") {
+		add("dify", "dify cloud", "托管", "无需安装", "sandbox")
+	}
+	if strings.Contains(query, "本地") || strings.Contains(query, "自部署") {
+		add("dify", "自部署", "community edition", "docker compose", "基础设施")
+	}
+	if strings.Contains(query, "安装") || strings.Contains(query, "部署") {
+		add("dify", "自部署", "docker compose", "community edition")
+	}
+	if strings.Contains(query, "主要功能") || strings.Contains(query, "功能") {
+		add("dify", "应用", "工作流", "对话流", "知识库", "agent", "发布")
+	}
+	if strings.Contains(query, "版本") {
+		add("dify", "dify cloud", "自部署", "community edition")
+	}
+	if len(expansions) == 0 {
+		return query
+	}
+	return strings.TrimSpace(query + " " + strings.Join(expansions, " "))
+}
+
 func tokenize(text string) []string {
-	text = strings.TrimSpace(text)
+	text = strings.ToLower(strings.TrimSpace(text))
 	if text == "" {
 		return nil
 	}
 
+	seen := map[string]bool{}
 	var tokens []string
+	add := func(token string) {
+		token = strings.TrimSpace(strings.ToLower(token))
+		if token == "" || seen[token] {
+			return
+		}
+		seen[token] = true
+		tokens = append(tokens, token)
+	}
+
+	for _, term := range keywordTerms {
+		if strings.Contains(text, term) {
+			add(term)
+		}
+	}
+
 	runes := []rune(text)
 
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
-		// 中文字符
-		if r >= 0x4e00 && r <= 0x9fff {
-			tokens = append(tokens, string(r))
-		} else if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
-			// 英文单词
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
 			start := i
-			for i < len(runes) && ((runes[i] >= 'a' && runes[i] <= 'z') ||
-				(runes[i] >= 'A' && runes[i] <= 'Z') ||
-				(runes[i] >= '0' && runes[i] <= '9')) {
+			for i < len(runes) && ((runes[i] >= 'a' && runes[i] <= 'z') || (runes[i] >= '0' && runes[i] <= '9')) {
 				i++
 			}
-			tokens = append(tokens, strings.ToLower(string(runes[start:i])))
+			word := string(runes[start:i])
+			if len(word) > 1 {
+				add(word)
+			}
 			i--
 		}
 	}

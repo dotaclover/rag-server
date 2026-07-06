@@ -33,17 +33,37 @@ func TestSearchFiltersBelowMinScore(t *testing.T) {
 
 	store = &Store{
 		Docs: []Document{
-			{ID: "low", Text: "试用期 工资"},
-			{ID: "high", Text: "试用期 一般 多久"},
+			{ID: "low", Text: "Dify 模型 配置"},
+			{ID: "high", Text: "Dify 工作流 对话流 区别"},
 		},
 	}
 
-	results := search("试用期一般多久", 5, 50)
+	results := search("Dify 工作流和对话流区别", 5, 50)
 	if len(results) != 1 {
 		t.Fatalf("got %d results, want 1: %#v", len(results), results)
 	}
 	if results[0].ID != "high" {
 		t.Fatalf("got result %q, want high", results[0].ID)
+	}
+}
+
+func TestSearchExpandsDifyCloudSelfHostFollowUp(t *testing.T) {
+	originalStore := store
+	t.Cleanup(func() { store = originalStore })
+
+	store = &Store{
+		Docs: []Document{
+			{ID: "env", Text: "本地安装的插件可用，浏览和自动升级不可用。"},
+			{ID: "home", Title: "Dify 文档", Text: "Dify Cloud 是托管平台，无需安装，并包含免费的 Sandbox 套餐。自部署是在自己的基础设施上运行开源的 Community Edition，使用 Docker Compose 几分钟即可完成部署。"},
+		},
+	}
+
+	results := search("本地安装和线上版本有什么区别", 5, 50)
+	if len(results) == 0 {
+		t.Fatal("got no results")
+	}
+	if results[0].ID != "home" {
+		t.Fatalf("got top result %q, want home: %#v", results[0].ID, results)
 	}
 }
 

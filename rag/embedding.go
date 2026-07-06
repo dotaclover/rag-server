@@ -7,12 +7,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"go-agent-studio/services/llm"
+	"io"
 	"math"
 	"net/http"
 	"strings"
 	"time"
 )
+
+const maxEmbeddingResponseBytes = 4 << 20
 
 type Embedder interface {
 	Name() string
@@ -121,14 +123,18 @@ func (e *OpenAIEmbedder) Embed(ctx context.Context, text string) ([]float64, err
 		return nil, fmt.Errorf("embedding request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	body, err := llm.ReadLimitedBody(resp.Body)
+	body, err := readLimitedBody(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read embedding response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, llm.APIStatusError("embedding", resp.StatusCode, body)
+		return nil, fmt.Errorf("embedding API returned status %d: %s", resp.StatusCode, string(body))
 	}
 	return parseEmbeddingResponse(body)
+}
+
+func readLimitedBody(r io.Reader) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(r, maxEmbeddingResponseBytes))
 }
 
 // parseEmbeddingResponse 解析 OpenAI 标准格式（data 为数组）和 Ark 格式（data 为单对象）。
