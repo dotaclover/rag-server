@@ -290,7 +290,8 @@
             console.log('Search results:', data);
             
             if (!data.results || data.results.length === 0) {
-                results.innerHTML = '<div class="result-card">😔 未找到相关结果</div>';
+                const message = data.message || '未找到达到最低相关度要求的结果';
+                results.innerHTML = `<div class="result-card">😔 ${escapeHtml(message)}</div>`;
                 results.style.display = 'block';
                 return;
             }

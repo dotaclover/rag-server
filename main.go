@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -21,6 +22,7 @@ var (
 	host      = flag.String("host", "127.0.0.1", "HTTP host")
 	port      = flag.String("port", "9093", "HTTP port")
 	indexPath = flag.String("index", "data/index.bin", "Path to RAG index")
+	minScore  = flag.Float64("min-score", defaultMinScore(), "Minimum result score; accepts 0-1 or 0-100")
 )
 
 type Document struct {
@@ -41,14 +43,17 @@ type Store struct {
 }
 
 type SearchRequest struct {
-	Query string `json:"query"`
-	TopK  int    `json:"top_k"`
+	Query    string   `json:"query"`
+	TopK     int      `json:"top_k"`
+	MinScore *float64 `json:"min_score,omitempty"`
 }
 
 type SearchResponse struct {
-	Query   string   `json:"query"`
-	Results []Result `json:"results"`
-	Total   int      `json:"total"`
+	Query    string   `json:"query"`
+	Results  []Result `json:"results"`
+	Total    int      `json:"total"`
+	MinScore float64  `json:"min_score"`
+	Message  string   `json:"message,omitempty"`
 }
 
 type Result struct {
@@ -64,25 +69,26 @@ var store *Store
 
 func main() {
 	flag.Parse()
-	
+
 	log.Printf("Loading index from: %s", *indexPath)
 	if err := loadIndex(*indexPath); err != nil {
 		log.Fatalf("Failed to load index: %v", err)
 	}
-	
+
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/api/search", handleSearch)
 	http.HandleFunc("/api/status", handleStatus)
-	
+
 	addr := *host + ":" + *port
-	fmt.Printf("\n" + strings.Repeat("=", 50) + "\n")
+	fmt.Print("\n" + strings.Repeat("=", 50) + "\n")
 	fmt.Printf("  ACFlow RAG 检索服务\n")
-	fmt.Printf(strings.Repeat("=", 50) + "\n\n")
+	fmt.Print(strings.Repeat("=", 50) + "\n\n")
 	fmt.Printf("  🌐 访问地址: http://%s\n", addr)
 	fmt.Printf("  📚 文档数量: %d\n", len(store.Docs))
 	fmt.Printf("  📊 向量维度: %d\n", store.Dimension)
 	fmt.Printf("  🤖 模型: %s\n\n", store.Model)
-	
+	fmt.Printf("  🎚️ 最低相关度: %d%%\n\n", scorePercent(configuredMinScore()))
+
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
@@ -92,16 +98,16 @@ func loadIndex(path string) error {
 		return fmt.Errorf("open index: %w", err)
 	}
 	defer f.Close()
-	
+
 	store = &Store{}
 	if err := gob.NewDecoder(f).Decode(store); err != nil {
 		return fmt.Errorf("decode index: %w", err)
 	}
-	
+
 	if len(store.Docs) == 0 {
 		return fmt.Errorf("index is empty")
 	}
-	
+
 	return nil
 }
 
@@ -120,33 +126,41 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", 405)
 		return
 	}
-	
+
 	var req SearchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request", 400)
 		return
 	}
-	
+
 	if req.TopK <= 0 {
 		req.TopK = 5
 	}
 	if req.TopK > 10 {
 		req.TopK = 10
 	}
-	
+
 	if store == nil || len(store.Docs) == 0 {
 		http.Error(w, "Index not loaded", 503)
 		return
 	}
-	
-	results := search(req.Query, req.TopK)
-	
-	resp := SearchResponse{
-		Query:   req.Query,
-		Results: results,
-		Total:   len(results),
+
+	threshold := configuredMinScore()
+	if req.MinScore != nil {
+		threshold = normalizeScoreThreshold(*req.MinScore)
 	}
-	
+	results := search(req.Query, req.TopK, threshold)
+
+	resp := SearchResponse{
+		Query:    req.Query,
+		Results:  results,
+		Total:    len(results),
+		MinScore: threshold,
+	}
+	if len(results) == 0 {
+		resp.Message = noResultsMessage(threshold)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
@@ -156,6 +170,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		"loaded":    store != nil && len(store.Docs) > 0,
 		"documents": 0,
 		"indexPath": *indexPath,
+		"minScore":  configuredMinScore(),
 	}
 	if store != nil {
 		status["documents"] = len(store.Docs)
@@ -166,32 +181,33 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(status)
 }
 
-func search(query string, topK int) []Result {
+func search(query string, topK int, minScore float64) []Result {
 	queryLower := strings.ToLower(query)
-	
+	minScore = normalizeScoreThreshold(minScore)
+
 	type scored struct {
 		doc   Document
 		score float64
 	}
-	
+
 	var scores []scored
 	for _, doc := range store.Docs {
 		textLower := strings.ToLower(doc.Title + " " + doc.Section + " " + doc.Text)
 		score := keywordScore(queryLower, textLower)
-		
-		if score > 0 {
+
+		if score >= minScore {
 			scores = append(scores, scored{doc, score})
 		}
 	}
-	
+
 	sort.Slice(scores, func(i, j int) bool {
 		return scores[i].score > scores[j].score
 	})
-	
+
 	if len(scores) > topK {
 		scores = scores[:topK]
 	}
-	
+
 	results := make([]Result, len(scores))
 	for i, s := range scores {
 		text := s.doc.Text
@@ -209,8 +225,48 @@ func search(query string, topK int) []Result {
 			Score:   math.Round(s.score*1000000) / 1000000,
 		}
 	}
-	
+
 	return results
+}
+
+func defaultMinScore() float64 {
+	value := strings.TrimSpace(os.Getenv("RAG_MIN_SCORE"))
+	if value == "" {
+		return 50
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 50
+	}
+	return parsed
+}
+
+func configuredMinScore() float64 {
+	return normalizeScoreThreshold(*minScore)
+}
+
+func normalizeScoreThreshold(value float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0.5
+	}
+	if value < 0 {
+		return 0
+	}
+	if value > 1 {
+		value = value / 100
+	}
+	if value > 1 {
+		return 1
+	}
+	return value
+}
+
+func scorePercent(score float64) int {
+	return int(math.Round(normalizeScoreThreshold(score) * 100))
+}
+
+func noResultsMessage(minScore float64) string {
+	return fmt.Sprintf("未找到相关度不低于 %d%% 的参考资料，请换个更具体的问题或降低阈值后重试。", scorePercent(minScore))
 }
 
 func keywordScore(query, text string) float64 {
@@ -219,25 +275,25 @@ func keywordScore(query, text string) float64 {
 	if len(tokens) == 0 {
 		return 0
 	}
-	
+
 	matched := 0
 	for _, token := range tokens {
 		if token != "" && strings.Contains(text, token) {
 			matched++
 		}
 	}
-	
+
 	score := float64(matched) / float64(len(tokens))
-	
+
 	// 完全匹配加分
 	if strings.Contains(text, query) {
 		score += 0.3
 	}
-	
+
 	if score > 1 {
 		score = 1
 	}
-	
+
 	return score
 }
 
@@ -246,10 +302,10 @@ func tokenize(text string) []string {
 	if text == "" {
 		return nil
 	}
-	
+
 	var tokens []string
 	runes := []rune(text)
-	
+
 	for i := 0; i < len(runes); i++ {
 		r := runes[i]
 		// 中文字符
@@ -258,8 +314,8 @@ func tokenize(text string) []string {
 		} else if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
 			// 英文单词
 			start := i
-			for i < len(runes) && ((runes[i] >= 'a' && runes[i] <= 'z') || 
-				(runes[i] >= 'A' && runes[i] <= 'Z') || 
+			for i < len(runes) && ((runes[i] >= 'a' && runes[i] <= 'z') ||
+				(runes[i] >= 'A' && runes[i] <= 'Z') ||
 				(runes[i] >= '0' && runes[i] <= '9')) {
 				i++
 			}
@@ -267,6 +323,6 @@ func tokenize(text string) []string {
 			i--
 		}
 	}
-	
+
 	return tokens
 }

@@ -51,6 +51,17 @@ Content-Type: application/json
 ```json
 {
   "query": "试用期一般多久",
+  "top_k": 5,
+  "min_score": 50
+}
+```
+
+`min_score` 可选，支持 `50` 或 `0.5` 两种写法，表示最低相关度 50%。未传时使用服务配置，默认 50%。
+
+响应:
+```json
+{
+  "query": "试用期一般多久",
   "results": [
     {
       "id": "labor_law_19",
@@ -61,7 +72,20 @@ Content-Type: application/json
       "score": 0.95
     }
   ],
-  "total": 5
+  "total": 5,
+  "min_score": 0.5
+}
+```
+
+没有达到阈值的结果时:
+
+```json
+{
+  "query": "通用问题",
+  "results": [],
+  "total": 0,
+  "min_score": 0.5,
+  "message": "未找到相关度不低于 50% 的参考资料，请换个更具体的问题或降低阈值后重试。"
 }
 ```
 
@@ -97,6 +121,13 @@ go run main.go -port 9093
 
 # 指定索引路径
 go run main.go -index data/index.bin
+
+# 指定最低相关度；50 和 0.5 都表示 50%
+go run main.go -min-score 50
+
+# 也可用环境变量配置
+$env:RAG_MIN_SCORE='50'
+go run main.go
 ```
 
 ## 📂 项目结构
