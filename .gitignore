@@ -1,5 +1,15 @@
 *.exe
 *.dll
 *.so
-data/index.bin
+*.dylib
+*.a
+*.o
+*.obj
+*.lib
+*.pdb
+*.bin
+buildindex
+buildindex-*
+rag-server
+rag-server-*
 vendor/

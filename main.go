@@ -1,8 +1,8 @@
 package main
 
 import (
+	"context"
 	"embed"
-	"encoding/gob"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -10,50 +10,36 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
+
+	"acflow-rag/rag"
+	"acflow-rag/rag/profiles"
 )
 
 //go:embed static/*
 var content embed.FS
 
 var (
-	host      = flag.String("host", "127.0.0.1", "HTTP host")
-	port      = flag.String("port", "9093", "HTTP port")
-	indexPath = flag.String("index", "data/index.bin", "Path to RAG index")
-	minScore  = flag.Float64("min-score", defaultMinScore(), "Minimum result score; accepts 0-1 or 0-100")
+	host             = flag.String("host", "127.0.0.1", "HTTP host")
+	port             = flag.String("port", "9093", "HTTP port")
+	indexPath        = flag.String("index", "", "Path to single RAG index (legacy mode)")
+	domainsDir       = flag.String("domains-dir", "data/domains", "Directory containing domain subdirectories")
+	defaultDomain    = flag.String("default-domain", "labor_law", "Default search domain")
+	rebuild          = flag.Bool("rebuild", false, "Rebuild index from source JSONL")
+	sourcePath       = flag.String("source", "data/source.jsonl", "Source JSONL for rebuild")
+	minScore         = flag.Float64("min-score", 0.5, "Minimum result score (0-1)")
+	embeddingBaseURL = flag.String("embedding-url", "http://127.0.0.1:9092", "Embedding server base URL")
+	embeddingModel   = flag.String("embedding-model", "bge-small-zh-v1.5", "Embedding model name")
+	embeddingPath    = flag.String("embedding-path", "/v1/embeddings", "Embedding API path")
 )
-
-type Document struct {
-	ID        string
-	Title     string
-	Source    string
-	Section   string
-	Text      string
-	Metadata  map[string]string
-	Embedding []float64
-}
-
-type Store struct {
-	Version   int
-	Model     string
-	Dimension int
-	Docs      []Document
-}
 
 type SearchRequest struct {
 	Query    string   `json:"query"`
+	Domain   string   `json:"domain,omitempty"`
 	TopK     int      `json:"top_k"`
 	MinScore *float64 `json:"min_score,omitempty"`
-}
-
-type SearchResponse struct {
-	Query    string   `json:"query"`
-	Results  []Result `json:"results"`
-	Total    int      `json:"total"`
-	MinScore float64  `json:"min_score"`
-	Message  string   `json:"message,omitempty"`
 }
 
 type Result struct {
@@ -65,15 +51,51 @@ type Result struct {
 	Score   float64 `json:"score"`
 }
 
-var store *Store
+type SearchResponse struct {
+	Domain   string   `json:"domain"`
+	Query    string   `json:"query"`
+	Results  []Result `json:"results"`
+	Total    int      `json:"total"`
+	MinScore float64  `json:"min_score"`
+	Message  string   `json:"message,omitempty"`
+}
+
+type DomainRuntime struct {
+	Name      string
+	IndexPath string
+	Store     *rag.Store
+	Searcher  *rag.Searcher
+	Profile   *rag.DomainProfile
+}
+
+var domains map[string]*DomainRuntime
 
 func main() {
 	flag.Parse()
 
-	log.Printf("Loading index from: %s", *indexPath)
-	if err := loadIndex(*indexPath); err != nil {
-		log.Fatalf("Failed to load index: %v", err)
+	embedder := rag.NewOpenAIEmbedderWithPath("",
+		strings.TrimRight(*embeddingBaseURL, "/"),
+		*embeddingModel, 0, *embeddingPath)
+
+	if *rebuild {
+		log.Printf("Rebuilding index from: %s", *sourcePath)
+		ctx := context.Background()
+		store, err := rag.BuildFromJSONL(ctx, *sourcePath, embedder)
+		if err != nil {
+			log.Fatalf("Rebuild failed: %v", err)
+		}
+		if err := store.Save(*indexPath); err != nil {
+			log.Fatalf("Save index failed: %v", err)
+		}
+		log.Printf("Rebuild done: %d docs, %d dims, model=%s", len(store.Docs), store.Dimension, store.Model)
+		return
 	}
+
+	loadedDomains, err := loadDomains(embedder)
+	if err != nil {
+		log.Fatalf("Failed to load domains: %v", err)
+	}
+	domains = loadedDomains
 
 	http.HandleFunc("/", handleIndex)
 	http.HandleFunc("/api/search", handleSearch)
@@ -84,31 +106,20 @@ func main() {
 	fmt.Printf("  ACFlow RAG 检索服务\n")
 	fmt.Print(strings.Repeat("=", 50) + "\n\n")
 	fmt.Printf("  🌐 访问地址: http://%s\n", addr)
-	fmt.Printf("  📚 文档数量: %d\n", len(store.Docs))
-	fmt.Printf("  📊 向量维度: %d\n", store.Dimension)
-	fmt.Printf("  🤖 模型: %s\n\n", store.Model)
-	fmt.Printf("  🎚️ 最低相关度: %d%%\n\n", scorePercent(configuredMinScore()))
+	fmt.Printf("  🧭 默认知识库: %s\n", *defaultDomain)
+	for _, name := range sortedDomainNames(domains) {
+		domain := domains[name]
+		profile := ""
+		if domain.Profile != nil {
+			profile = domain.Profile.Name
+		}
+		fmt.Printf("  📚 %s: %d docs, %d dims, model=%s, profile=%s\n",
+			domain.Name, len(domain.Store.Docs), domain.Store.Dimension, domain.Store.Model, profile)
+	}
+	fmt.Printf("  🔗 Embedding 服务器: %s\n\n", *embeddingBaseURL)
+	fmt.Printf("  🎚️ 最低相关度: %d%%\n\n", int(*minScore*100))
 
 	log.Fatal(http.ListenAndServe(addr, nil))
-}
-
-func loadIndex(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open index: %w", err)
-	}
-	defer f.Close()
-
-	store = &Store{}
-	if err := gob.NewDecoder(f).Decode(store); err != nil {
-		return fmt.Errorf("decode index: %w", err)
-	}
-
-	if len(store.Docs) == 0 {
-		return fmt.Errorf("index is empty")
-	}
-
-	return nil
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -140,25 +151,64 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		req.TopK = 10
 	}
 
-	if store == nil || len(store.Docs) == 0 {
-		http.Error(w, "Index not loaded", 503)
+	domainName := normalizeDomain(req.Domain)
+	if domainName == "" {
+		domainName = normalizeDomain(r.URL.Query().Get("domain"))
+	}
+	if domainName == "" {
+		domainName = normalizeDomain(r.Header.Get("X-RAG-Domain"))
+	}
+	if domainName == "" {
+		domainName = normalizeDomain(*defaultDomain)
+	}
+	domain, ok := domains[domainName]
+	if !ok || domain == nil || domain.Searcher == nil || !domain.Searcher.Loaded() {
+		http.Error(w, fmt.Sprintf("Unknown or unloaded domain: %s", domainName), 404)
 		return
 	}
 
-	threshold := configuredMinScore()
+	threshold := *minScore
 	if req.MinScore != nil {
 		threshold = normalizeScoreThreshold(*req.MinScore)
 	}
-	results := search(req.Query, req.TopK, threshold)
+
+	ragResults, err := domain.Searcher.SearchWithOptions(r.Context(), req.Query, rag.SearchOptions{
+		TopK:     req.TopK,
+		MinScore: threshold,
+		Profile:  domain.Profile,
+	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Search error: %v", err), 500)
+		return
+	}
+
+	results := make([]Result, 0, len(ragResults))
+	for _, rr := range ragResults {
+		text := rr.Text
+		runes := []rune(text)
+		if len(runes) > 520 {
+			text = string(runes[:520]) + "..."
+		}
+		results = append(results, Result{
+			ID:      rr.ID,
+			Title:   rr.Title,
+			Source:  rr.Source,
+			Section: rr.Section,
+			Text:    text,
+			Score:   math.Round(rr.Score*1000000) / 1000000,
+		})
+	}
 
 	resp := SearchResponse{
+		Domain:   domain.Name,
 		Query:    req.Query,
 		Results:  results,
 		Total:    len(results),
 		MinScore: threshold,
 	}
 	if len(results) == 0 {
-		resp.Message = noResultsMessage(threshold)
+		resp.Message = fmt.Sprintf("未找到相关度不低于 %d%% 的参考资料，请换个更具体的问题或降低阈值后重试。",
+			int(threshold*100))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -166,83 +216,162 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
-	status := map[string]interface{}{
-		"loaded":    store != nil && len(store.Docs) > 0,
-		"documents": 0,
-		"indexPath": *indexPath,
-		"minScore":  configuredMinScore(),
+	domainName := normalizeDomain(r.URL.Query().Get("domain"))
+	if domainName != "" {
+		domain, ok := domains[domainName]
+		if !ok {
+			http.Error(w, fmt.Sprintf("Unknown domain: %s", domainName), 404)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(domainStatus(domain))
+		return
 	}
-	if store != nil {
-		status["documents"] = len(store.Docs)
-		status["dimension"] = store.Dimension
-		status["model"] = store.Model
+
+	status := map[string]interface{}{
+		"loaded":        len(domains) > 0,
+		"defaultDomain": *defaultDomain,
+		"domainsDir":    *domainsDir,
+		"minScore":      *minScore,
+		"domains":       map[string]interface{}{},
+	}
+	domainStatuses := status["domains"].(map[string]interface{})
+	for _, name := range sortedDomainNames(domains) {
+		domainStatuses[name] = domainStatus(domains[name])
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(status)
 }
 
-func search(query string, topK int, minScore float64) []Result {
-	queryLower := expandProductDocsQuery(strings.ToLower(query))
-	minScore = normalizeScoreThreshold(minScore)
-
-	type scored struct {
-		doc   Document
-		score float64
-	}
-
-	var scores []scored
-	for _, doc := range store.Docs {
-		textLower := strings.ToLower(doc.Title + " " + doc.Section + " " + doc.Text)
-		score := keywordScore(queryLower, textLower)
-
-		if score >= minScore {
-			scores = append(scores, scored{doc, score})
+func loadDomains(embedder rag.Embedder) (map[string]*DomainRuntime, error) {
+	if strings.TrimSpace(*indexPath) != "" {
+		store, err := rag.Load(*indexPath)
+		if err != nil {
+			return nil, fmt.Errorf("load index %s: %w", *indexPath, err)
 		}
-	}
-
-	sort.Slice(scores, func(i, j int) bool {
-		return scores[i].score > scores[j].score
-	})
-
-	if len(scores) > topK {
-		scores = scores[:topK]
-	}
-
-	results := make([]Result, len(scores))
-	for i, s := range scores {
-		text := s.doc.Text
-		// 按字符数截断，不是字节数，避免中文乱码
-		runes := []rune(text)
-		if len(runes) > 520 {
-			text = string(runes[:520]) + "..."
+		name := normalizeDomain(*defaultDomain)
+		if name == "" {
+			name = detectDomainName(*indexPath, store)
 		}
-		results[i] = Result{
-			ID:      s.doc.ID,
-			Title:   s.doc.Title,
-			Source:  s.doc.Source,
-			Section: s.doc.Section,
-			Text:    text,
-			Score:   math.Round(s.score*1000000) / 1000000,
-		}
+		return map[string]*DomainRuntime{
+			name: newDomainRuntime(name, *indexPath, store, embedder),
+		}, nil
 	}
 
-	return results
-}
-
-func defaultMinScore() float64 {
-	value := strings.TrimSpace(os.Getenv("RAG_MIN_SCORE"))
-	if value == "" {
-		return 50
-	}
-	parsed, err := strconv.ParseFloat(value, 64)
+	entries, err := os.ReadDir(*domainsDir)
 	if err != nil {
-		return 50
+		return nil, fmt.Errorf("read domains dir %s: %w", *domainsDir, err)
 	}
-	return parsed
+
+	out := map[string]*DomainRuntime{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := normalizeDomain(entry.Name())
+		if name == "" {
+			continue
+		}
+		index := filepath.Join(*domainsDir, entry.Name(), "index.bin")
+		store, err := rag.Load(index)
+		if err != nil {
+			return nil, fmt.Errorf("load domain %s index %s: %w", name, index, err)
+		}
+		out[name] = newDomainRuntime(name, index, store, embedder)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no domains loaded from %s", *domainsDir)
+	}
+	if _, ok := out[normalizeDomain(*defaultDomain)]; !ok {
+		return nil, fmt.Errorf("default domain %q not loaded", *defaultDomain)
+	}
+	return out, nil
 }
 
-func configuredMinScore() float64 {
-	return normalizeScoreThreshold(*minScore)
+func newDomainRuntime(name, indexPath string, store *rag.Store, embedder rag.Embedder) *DomainRuntime {
+	return &DomainRuntime{
+		Name:      name,
+		IndexPath: indexPath,
+		Store:     store,
+		Searcher:  rag.NewSearcher(store, embedder),
+		Profile:   detectProfile(name, indexPath, store),
+	}
+}
+
+func detectProfile(domainName, indexPath string, store *rag.Store) *rag.DomainProfile {
+	switch normalizeDomain(domainName) {
+	case "labor_law", "labor", "law":
+		return profiles.LaborLawProfile()
+	case "dify_docs", "dify":
+		return profiles.DifyDocsProfile()
+	}
+	detected := detectDomainName(indexPath, store)
+	if detected == "labor_law" {
+		return profiles.LaborLawProfile()
+	}
+	if detected == "dify_docs" {
+		return profiles.DifyDocsProfile()
+	}
+	return nil
+}
+
+func detectDomainName(indexPath string, store *rag.Store) string {
+	lowerPath := strings.ToLower(filepath.ToSlash(indexPath))
+	if strings.Contains(lowerPath, "labor") || storeContainsSource(store, "劳动法") || storeContainsSource(store, "劳动合同法") {
+		return "labor_law"
+	}
+	if strings.Contains(lowerPath, "dify") || storeContainsSource(store, "Dify 中文文档") {
+		return "dify_docs"
+	}
+	return "default"
+}
+
+func storeContainsSource(store *rag.Store, source string) bool {
+	if store == nil {
+		return false
+	}
+	for _, doc := range store.Docs {
+		if doc.Source == source {
+			return true
+		}
+	}
+	return false
+}
+
+func domainStatus(domain *DomainRuntime) map[string]interface{} {
+	status := map[string]interface{}{
+		"name":      domain.Name,
+		"loaded":    false,
+		"documents": 0,
+		"indexPath": domain.IndexPath,
+	}
+	if domain == nil {
+		return status
+	}
+	if domain.Profile != nil {
+		status["profile"] = domain.Profile.Name
+	}
+	if domain.Searcher != nil {
+		stats := domain.Searcher.Stats()
+		for k, v := range stats {
+			status[k] = v
+		}
+		status["loaded"] = domain.Searcher.Loaded()
+	}
+	return status
+}
+
+func sortedDomainNames(domains map[string]*DomainRuntime) []string {
+	names := make([]string, 0, len(domains))
+	for name := range domains {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func normalizeDomain(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 func normalizeScoreThreshold(value float64) float64 {
@@ -259,126 +388,4 @@ func normalizeScoreThreshold(value float64) float64 {
 		return 1
 	}
 	return value
-}
-
-func scorePercent(score float64) int {
-	return int(math.Round(normalizeScoreThreshold(score) * 100))
-}
-
-func noResultsMessage(minScore float64) string {
-	return fmt.Sprintf("未找到相关度不低于 %d%% 的参考资料，请换个更具体的问题或降低阈值后重试。", scorePercent(minScore))
-}
-
-func keywordScore(query, text string) float64 {
-	tokens := tokenize(query)
-	if len(tokens) == 0 {
-		return 0
-	}
-
-	matched := 0
-	for _, token := range tokens {
-		if token != "" && strings.Contains(text, token) {
-			matched++
-		}
-	}
-
-	score := float64(matched) / float64(len(tokens))
-
-	// 完全匹配加分
-	if strings.Contains(text, query) {
-		score += 0.3
-	}
-
-	if score > 1 {
-		score = 1
-	}
-
-	return score
-}
-
-var keywordTerms = []string{
-	"default model", "http request", "knowledge", "marketplace", "provider", "workflow", "chatflow",
-	"embedding", "webapp", "agent", "dify", "dify cloud", "api", "llm", "mcp", "rag",
-	"docker", "docker compose", "compose", "cloud", "sandbox", "community edition",
-	"模型供应商", "外部知识库", "默认模型", "工作空间", "聊天助手", "文本生成", "问题分类器",
-	"知识库", "工作流", "对话流", "数据源", "提示词", "发布", "应用", "节点", "模型",
-	"插件", "集成", "工具", "团队", "成员", "权限", "变量", "会话", "记忆", "日志",
-	"监控", "文档", "分段", "索引", "检索", "召回", "重排序", "嵌入", "接口", "密钥",
-	"创建", "测试", "配置", "导入", "上传", "部署", "安装", "调用", "发布", "调试",
-	"运行", "输出", "输入", "文件", "套餐", "用量", "主要功能", "功能", "区别",
-	"本地", "线上", "版本", "自部署", "本地部署", "托管", "基础设施", "开源",
-	"开箱即用", "沙箱", "社区版",
-}
-
-func expandProductDocsQuery(query string) string {
-	var expansions []string
-	add := func(terms ...string) {
-		for _, term := range terms {
-			if !strings.Contains(query, strings.ToLower(term)) {
-				expansions = append(expansions, term)
-			}
-		}
-	}
-	if strings.Contains(query, "线上") || strings.Contains(query, "cloud") {
-		add("dify", "dify cloud", "托管", "无需安装", "sandbox")
-	}
-	if strings.Contains(query, "本地") || strings.Contains(query, "自部署") {
-		add("dify", "自部署", "community edition", "docker compose", "基础设施")
-	}
-	if strings.Contains(query, "安装") || strings.Contains(query, "部署") {
-		add("dify", "自部署", "docker compose", "community edition")
-	}
-	if strings.Contains(query, "主要功能") || strings.Contains(query, "功能") {
-		add("dify", "应用", "工作流", "对话流", "知识库", "agent", "发布")
-	}
-	if strings.Contains(query, "版本") {
-		add("dify", "dify cloud", "自部署", "community edition")
-	}
-	if len(expansions) == 0 {
-		return query
-	}
-	return strings.TrimSpace(query + " " + strings.Join(expansions, " "))
-}
-
-func tokenize(text string) []string {
-	text = strings.ToLower(strings.TrimSpace(text))
-	if text == "" {
-		return nil
-	}
-
-	seen := map[string]bool{}
-	var tokens []string
-	add := func(token string) {
-		token = strings.TrimSpace(strings.ToLower(token))
-		if token == "" || seen[token] {
-			return
-		}
-		seen[token] = true
-		tokens = append(tokens, token)
-	}
-
-	for _, term := range keywordTerms {
-		if strings.Contains(text, term) {
-			add(term)
-		}
-	}
-
-	runes := []rune(text)
-
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			start := i
-			for i < len(runes) && ((runes[i] >= 'a' && runes[i] <= 'z') || (runes[i] >= '0' && runes[i] <= '9')) {
-				i++
-			}
-			word := string(runes[start:i])
-			if len(word) > 1 {
-				add(word)
-			}
-			i--
-		}
-	}
-
-	return tokens
 }

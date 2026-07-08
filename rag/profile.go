@@ -14,11 +14,13 @@ var DefaultWeights = ScoreWeights{Vector: 0.5, Keyword: 0.5}
 // DomainProfile 携带领域特定的检索调优参数，由通用引擎在查询时应用。
 // nil profile 表示纯通用行为：不扩展同义词、使用默认权重、不过滤来源。
 type DomainProfile struct {
-	Name     string              `json:"name"`
-	Synonyms map[string][]string `json:"synonyms"`
-	Phrases  []string            `json:"phrases,omitempty"`
-	Weights  ScoreWeights        `json:"weights"`
-	Sources  []string            `json:"sources"`
+	Name         string              `json:"name"`
+	Synonyms     map[string][]string `json:"synonyms"`
+	Expanders    map[string][]string `json:"expanders,omitempty"`
+	Phrases      []string            `json:"phrases,omitempty"`
+	KeywordTerms []string            `json:"keyword_terms,omitempty"`
+	Weights      ScoreWeights        `json:"weights"`
+	Sources      []string            `json:"sources"`
 }
 
 // weights 返回 profile 的权重；当 profile 为 nil 或权重全为零时回退到 DefaultWeights。
@@ -44,6 +46,11 @@ func (p *DomainProfile) expand(query string) string {
 			out += " " + strings.Join(terms, " ")
 		}
 	}
+	for key, terms := range p.Expanders {
+		if strings.Contains(query, strings.ToLower(key)) {
+			out += " " + strings.Join(missingTerms(out, terms), " ")
+		}
+	}
 	return out
 }
 
@@ -59,4 +66,23 @@ func (p *DomainProfile) allowsSource(source string) bool {
 		}
 	}
 	return false
+}
+
+// keywordTerms returns profile-specific keyword terms, or the built-in product
+// docs terms when no profile terms are configured.
+func (p *DomainProfile) keywordTerms() []string {
+	if p == nil {
+		return nil
+	}
+	return p.KeywordTerms
+}
+
+func missingTerms(query string, terms []string) []string {
+	var out []string
+	for _, term := range terms {
+		if !strings.Contains(query, strings.ToLower(term)) {
+			out = append(out, term)
+		}
+	}
+	return out
 }
